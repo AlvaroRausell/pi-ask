@@ -107,19 +107,28 @@ export PI_ASK_MODEL="openai/gpt-4.1-mini"
 
 ## Current questionnaire behavior
 
-- tab labels use `1 2 3 ...`
+- tab labels use `1 2 3 ...` with type icons (`≡` multi, `☑` checkbox)
 - final dedicated `Submit` tab
 - auto-jumps to `Submit` after the last answer
-- freeform fallback via `Write my own answer`
+- three question types:
+  - **single** — pick one option (default, numbered list with `>`)
+  - **checkbox** — yes/no toggle (radio-style `[●] / [○]` for Yes/No)
+  - **multi-select** — pick multiple options (checkbox-style `[■] / [□]`, Space to toggle, Enter to confirm)
+- freeform fallback via `Write my own answer` (single-select only)
 - simple fallback parsing if the small model does not return valid JSON
 - simple `A or B` option inference
+- automatic type inference from question phrasing:
+  - "all that apply", "which of", "select all" → multi-select
+  - "do you want", "should I", "would you like" → checkbox
+  - everything else → single
+- multi-select answers display as comma-separated labels in the submit tab and summary
 
 ## Planned future enhancements
 
-- richer question types like yes/no
-- multi-select
 - priority ranking
 - stronger validation and parsing
+- custom option entry in multi-select mode
+- conditional question flow (show q3 only if q2 is yes)
 
 ## Files
 

@@ -18,6 +18,7 @@ interface ParsedQuestion {
   prompt: string;
   options: ParsedOption[];
   allowOther: boolean;
+  type: "single" | "multi" | "checkbox";
 }
 
 interface ParsedQuestionSet {
@@ -31,6 +32,10 @@ interface Answer {
   label: string;
   wasCustom: boolean;
   index?: number;
+  values?: string[];
+  labels?: string[];
+  indices?: number[];
+  type: "single" | "multi" | "checkbox";
 }
 
 interface AskSettings {
@@ -85,10 +90,16 @@ Schema:
       "options": [
         { "value": "typescript", "label": "TypeScript" }
       ],
-      "allowOther": true
+      "allowOther": true,
+      "type": "single"
     }
   ]
 }
+
+Question types (set the "type" field):
+- "single" — default. Pick one option from a list.
+- "multi" — Pick multiple options. Use when the user can select several items ("which of", "select all that apply", "which features"). Provide 3-7 options. Set allowOther to false.
+- "checkbox" — Yes/no toggle. Use for binary enable/disable or yes/no questions ("do you want", "should I", "is it"). Set options to [{ "value": "yes", "label": "Yes" }, { "value": "no", "label": "No" }] and allowOther to false.
 
 Rules:
 - Extract 1-7 distinct questions.
@@ -98,6 +109,9 @@ Rules:
 - If no clear options exist, use an empty options array and set allowOther to true.
 - Always set allowOther to true unless the question is strictly binary and fully covered by options.
 - Keep prompts concise.
+- Set "type" to "multi" when the user can select multiple items from a list.
+- Set "type" to "checkbox" for yes/no or enable/disable questions.
+- Default to "single" if unsure.
 - Output valid JSON that can be parsed directly.
 - Do NOT think or reason. Just output the JSON immediately.`;
 
@@ -538,6 +552,8 @@ function normalizeQuestion(question: Partial<ParsedQuestion>, index: number): Pa
   const prompt = String(question.prompt ?? "").trim();
   const label = String(question.label ?? `${index + 1}`).trim() || `${index + 1}`;
   const id = slugify(question.id || label || `q${index + 1}`) || `q${index + 1}`;
+  let type: "single" | "multi" | "checkbox" =
+    question.type === "multi" || question.type === "checkbox" ? question.type : "single";
   const options = Array.isArray(question.options)
     ? question.options
         .map((option) => ({
@@ -546,16 +562,45 @@ function normalizeQuestion(question: Partial<ParsedQuestion>, index: number): Pa
           description: typeof option?.description === "string" ? option.description.trim() : undefined,
         }))
         .filter((option) => option.value && option.label)
-        .slice(0, 5)
+        .slice(0, type === "multi" ? 7 : 5)
     : [];
+
+  // Checkbox: force Yes/No options, no allowOther
+  if (type === "checkbox") {
+    return {
+      id,
+      label,
+      prompt,
+      options: options.length >= 2 ? options.slice(0, 2) : [{ value: "yes", label: "Yes" }, { value: "no", label: "No" }],
+      allowOther: false,
+      type: "checkbox",
+    };
+  }
+
+  // Multi with too few options: downgrade to single
+  if (type === "multi" && options.length < 2) {
+    type = "single";
+  }
 
   return {
     id,
     label,
     prompt,
     options,
-    allowOther: question.allowOther !== false,
+    allowOther: type === "multi" ? false : question.allowOther !== false,
+    type,
   };
+}
+
+function inferQuestionType(prompt: string): "single" | "multi" | "checkbox" {
+  const lower = prompt.toLowerCase();
+  if (/\b(all that apply|select all|which of the following|which features|which options|choose all|pick all|select multiple)\b/i.test(prompt)) {
+    return "multi";
+  }
+  if (/\b(do you want|should i|should we|is it|do you need|would you like|do you prefer)\b/i.test(prompt) && !/\bor\b/i.test(prompt)) {
+    return "checkbox";
+  }
+  return "single";
 }
 
 function fallbackParseQuestions(raw: string): ParsedQuestionSet {
@@ -568,13 +613,18 @@ function fallbackParseQuestions(raw: string): ParsedQuestionSet {
     .map((line) => line.replace(/^\d+[.)]\s*/, "").replace(/^[-*]\s*/, "").trim())
     .filter((line) => /\?$/.test(line) || /^(which|what|when|where|who|why|how|do|does|did|is|are|can|could|should|would|will)\b/i.test(line));
 
-  const questions = extracted.map((prompt, index) => ({
-    id: `q${index + 1}`,
-    label: `${index + 1}`,
-    prompt,
-    options: inferOptionsFromPrompt(prompt),
-    allowOther: true,
-  }));
+  const questions = extracted.map((prompt, index) => {
+    const type = inferQuestionType(prompt);
+    const options = type === "checkbox" ? [{ value: "yes", label: "Yes" }, { value: "no", label: "No" }] : inferOptionsFromPrompt(prompt);
+    return {
+      id: `q${index + 1}`,
+      label: `${index + 1}`,
+      prompt,
+      options,
+      allowOther: type !== "checkbox",
+      type,
+    } as ParsedQuestion;
+  });
 
   return { questions };
 }
@@ -615,11 +665,26 @@ function stripJsonFence(text: string): string {
 }
 
 function formatAnswerSummary(answers: Answer[]): string {
-  return answers.map((answer, index) => `${index + 1}. ${answer.question} — ${answer.label}`).join("\n");
+  return answers
+    .map((answer, index) => {
+      if (answer.type === "multi" && answer.labels && answer.labels.length > 1) {
+        return `${index + 1}. ${answer.question} — ${answer.labels.join(", ")}`;
+      }
+      return `${index + 1}. ${answer.question} — ${answer.label}`;
+    })
+    .join("\n");
 }
 
 function formatAnswerReply(answers: Answer[]): string {
-  return answers.map((answer, index) => `${index + 1}. ${answer.question}\nAnswer: ${answer.label}`).join("\n\n");
+  return answers
+    .map((answer, index) => {
+      if (answer.type === "multi" && answer.labels && answer.labels.length > 1) {
+        const items = answer.labels.map((label) => `  - ${label}`).join("\n");
+        return `${index + 1}. ${answer.question}\nAnswer:\n${items}`;
+      }
+      return `${index + 1}. ${answer.question}\nAnswer: ${answer.label}`;
+    })
+    .join("\n\n");
 }
 
 async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuestion[]): Promise<Answer[] | null> {
@@ -629,6 +694,7 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
     let inputMode = false;
     let cachedLines: string[] | undefined;
     const answers = new Map<string, Answer>();
+    const multiSelectedIndices = new Map<string, Set<number>>();
     const submitTabIndex = questions.length;
 
     const editorTheme: EditorTheme = {
@@ -649,16 +715,37 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
     };
 
     const getOptions = (question: ParsedQuestion): Array<ParsedOption & { isOther?: boolean }> => {
+      if (question.type === "checkbox") {
+        return [
+          { value: "yes", label: "Yes" },
+          { value: "no", label: "No" },
+        ];
+      }
       const options = [...question.options];
-      if (question.allowOther || options.length === 0) {
-        options.push({ value: "__other__", label: "Write my own answer", isOther: true });
+      if (question.type !== "multi" && (question.allowOther || options.length === 0)) {
+        options.push({ value: "__other__", label: "Write my own answer", isOther: true } as ParsedOption & { isOther: boolean });
       }
       return options;
     };
 
+    const getMultiSelectedSet = (question: ParsedQuestion): Set<number> => {
+      if (multiSelectedIndices.has(question.id)) {
+        return multiSelectedIndices.get(question.id)!;
+      }
+      if (answers.has(question.id)) {
+        const answer = answers.get(question.id)!;
+        const set = new Set(answer.indices || []);
+        multiSelectedIndices.set(question.id, set);
+        return set;
+      }
+      const set = new Set<number>();
+      multiSelectedIndices.set(question.id, set);
+      return set;
+    };
+
     const saveAnswer = (
       question: ParsedQuestion,
-      answer: { value: string; label: string; wasCustom: boolean; index?: number },
+      answer: { value: string; label: string; wasCustom: boolean; index?: number; type?: "single" | "multi" | "checkbox" },
     ) => {
       answers.set(question.id, {
         id: question.id,
@@ -667,6 +754,7 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
         label: answer.label,
         wasCustom: answer.wasCustom,
         index: answer.index,
+        type: answer.type || question.type || "single",
       });
     };
 
@@ -674,7 +762,7 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
       const question = questions[currentTab];
       const trimmed = value.trim();
       if (!question || !trimmed) return;
-      saveAnswer(question, { value: trimmed, label: trimmed, wasCustom: true });
+      saveAnswer(question, { value: trimmed, label: trimmed, wasCustom: true, type: "single" });
       inputMode = false;
       editor.setText("");
       currentTab = currentTab < questions.length - 1 ? currentTab + 1 : submitTabIndex;
@@ -698,7 +786,8 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
             ...questions.map((item, index) => {
               const active = index === currentTab;
               const answered = answers.has(item.id);
-              const label = ` ${answered ? "■" : "□"} ${item.label} `;
+              const typeIcon = item.type === "multi" ? " ≡" : item.type === "checkbox" ? " ☑" : "";
+              const label = ` ${answered ? "■" : "□"} ${item.label}${typeIcon} `;
               if (active) return theme.bg("selectedBg", theme.fg("text", label));
               return theme.fg(answered ? "success" : "muted", label);
             }),
@@ -716,18 +805,48 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
 
         if (question) {
           add(theme.fg("text", ` ${question.prompt}`));
+          if (question.type === "multi") {
+            add(theme.fg("dim", ` (select multiple)`));
+          } else if (question.type === "checkbox") {
+            add(theme.fg("dim", ` (yes / no)`));
+          }
           lines.push("");
 
-          options.forEach((option, index) => {
-            const selected = index === optionIndex;
-            const prefix = selected ? theme.fg("accent", "> ") : "  ";
-            const text = `${index + 1}. ${option.label}`;
-            add(prefix + (selected ? theme.fg("accent", text) : theme.fg("text", text)));
-            if (option.description) add(`     ${theme.fg("muted", option.description)}`);
-          });
+          if (question.type === "checkbox") {
+            options.forEach((option, i) => {
+              const selected = i === optionIndex;
+              const marker = selected ? "●" : "○";
+              const prefix = selected ? theme.fg("accent", "> ") : "  ";
+              const text = `[${marker}] ${option.label}`;
+              add(prefix + (selected ? theme.fg("accent", text) : theme.fg("text", text)));
+            });
+          } else if (question.type === "multi") {
+            const selectedSet = getMultiSelectedSet(question);
+            options.forEach((option, i) => {
+              const selected = i === optionIndex;
+              const checked = selectedSet.has(i);
+              const marker = checked ? "■" : "□";
+              const prefix = selected ? theme.fg("accent", "> ") : "  ";
+              const text = `[${marker}] ${option.label}`;
+              add(prefix + (selected ? theme.fg("accent", text) : theme.fg("text", text)));
+              if (option.description) add(`     ${theme.fg("muted", option.description)}`);
+            });
+            if (selectedSet.size > 0) {
+              lines.push("");
+              add(theme.fg("success", ` ${selectedSet.size} selected`));
+            }
+          } else {
+            options.forEach((option, index) => {
+              const selected = index === optionIndex;
+              const prefix = selected ? theme.fg("accent", "> ") : "  ";
+              const text = `${index + 1}. ${option.label}`;
+              add(prefix + (selected ? theme.fg("accent", text) : theme.fg("text", text)));
+              if (option.description) add(`     ${theme.fg("muted", option.description)}`);
+            });
+          }
 
           const answered = answers.get(question.id);
-          if (answered && !inputMode) {
+          if (answered && !inputMode && question.type !== "multi") {
             lines.push("");
             add(theme.fg("success", ` Current answer: ${answered.label}`));
           }
@@ -737,7 +856,13 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
           if (allAnswered) {
             questions.forEach((item, index) => {
               const answer = answers.get(item.id);
-              if (answer) add(theme.fg("text", ` ${index + 1}. ${answer.label}`));
+              if (answer) {
+                if (answer.type === "multi" && answer.labels && answer.labels.length > 1) {
+                  add(theme.fg("text", ` ${index + 1}. ${answer.labels.join(", ")}`));
+                } else {
+                  add(theme.fg("text", ` ${index + 1}. ${answer.label}`));
+                }
+              }
             });
             lines.push("");
             add(theme.fg("success", " Press Enter to finish"));
@@ -760,6 +885,8 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
           }
           lines.push("");
           add(theme.fg("dim", " Enter submit • Esc back"));
+        } else if (question?.type === "multi") {
+          add(theme.fg("dim", " Tab/←→ switch tabs • ↑↓ navigate • Space toggle • Enter confirm • Esc cancel"));
         } else {
           add(theme.fg("dim", " Tab/←→ switch tabs • ↑↓ select • Enter confirm • Esc cancel"));
         }
@@ -810,14 +937,73 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
           refresh();
           return;
         }
+
+        // Space key — toggle multi-select option
+        if (data === " " && question?.type === "multi") {
+          const set = getMultiSelectedSet(question);
+          if (set.has(optionIndex)) {
+            set.delete(optionIndex);
+          } else {
+            set.add(optionIndex);
+          }
+          refresh();
+          return;
+        }
+
         if (matchesKey(data, Key.enter)) {
           if (!question) {
             if (allAnswered) {
-              done(questions.map((question) => answers.get(question.id)).filter((answer): answer is Answer => Boolean(answer)));
+              done(questions.map((q) => answers.get(q.id)).filter((a): a is Answer => Boolean(a)));
             }
             return;
           }
 
+          if (question.type === "checkbox") {
+            const selected = options[optionIndex];
+            if (!selected) return;
+            saveAnswer(question, {
+              value: selected.value,
+              label: selected.label,
+              wasCustom: false,
+              index: optionIndex,
+              type: "checkbox",
+            });
+            currentTab = currentTab < questions.length - 1 ? currentTab + 1 : submitTabIndex;
+            optionIndex = 0;
+            refresh();
+            return;
+          }
+
+          if (question.type === "multi") {
+            const set = getMultiSelectedSet(question);
+            if (set.size === 0) {
+              // No selections — toggle current item as a convenience
+              set.add(optionIndex);
+              refresh();
+              return;
+            }
+            const sortedIndices = [...set].sort((a, b) => a - b);
+            const questionOptions = question.options;
+            const selectedOptions = sortedIndices.map((i) => questionOptions[i]).filter(Boolean);
+            answers.set(question.id, {
+              id: question.id,
+              question: question.prompt,
+              value: selectedOptions.map((o) => o.value).join(", "),
+              label: selectedOptions.map((o) => o.label).join(", "),
+              wasCustom: false,
+              index: sortedIndices[0],
+              values: selectedOptions.map((o) => o.value),
+              labels: selectedOptions.map((o) => o.label),
+              indices: sortedIndices,
+              type: "multi",
+            });
+            currentTab = currentTab < questions.length - 1 ? currentTab + 1 : submitTabIndex;
+            optionIndex = 0;
+            refresh();
+            return;
+          }
+
+          // Single select (default)
           const selected = options[optionIndex];
           if (!selected) return;
           if (selected.isOther) {
@@ -831,6 +1017,7 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
             label: selected.label,
             wasCustom: false,
             index: optionIndex + 1,
+            type: "single",
           });
           currentTab = currentTab < questions.length - 1 ? currentTab + 1 : submitTabIndex;
           optionIndex = 0;
