@@ -1,0 +1,32 @@
+{
+  "name": "pi-ask",
+  "version": "0.1.0",
+  "description": "Pi package for interactive multi-question clarification flows, with a model-callable ask_questions tool and tabbed questionnaire UI.",
+  "keywords": ["pi-package", "pi", "skill", "extension", "questionnaire", "clarification"],
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlvaroRausell/pi-ask.git"
+  },
+  "homepage": "https://github.com/AlvaroRausell/pi-ask#readme",
+  "bugs": {
+    "url": "https://github.com/AlvaroRausell/pi-ask/issues"
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  }
+}

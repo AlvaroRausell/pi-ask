@@ -1,0 +1,845 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { complete, type Model, type UserMessage } from "@mariozechner/pi-ai";
+import { getAgentDir, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Container, Editor, type EditorTheme, Key, matchesKey, SettingsList, Text, truncateToWidth } from "@mariozechner/pi-tui";
+import { Type } from "@sinclair/typebox";
+
+interface ParsedOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+interface ParsedQuestion {
+  id: string;
+  label: string;
+  prompt: string;
+  options: ParsedOption[];
+  allowOther: boolean;
+}
+
+interface ParsedQuestionSet {
+  questions: ParsedQuestion[];
+}
+
+interface Answer {
+  id: string;
+  question: string;
+  value: string;
+  label: string;
+  wasCustom: boolean;
+  index?: number;
+}
+
+interface AskSettings {
+  model?: string;
+}
+
+interface MessageEntryLike {
+  type: string;
+  message?: {
+    role?: string;
+    content?: Array<{ type?: string; text?: string }>;
+  };
+}
+
+interface AskCommandContext {
+  hasUI: boolean;
+  signal?: AbortSignal;
+  model?: Model;
+  ui: {
+    notify(message: string, level: "info" | "success" | "warning" | "error"): void;
+    setEditorText(text: string): void;
+    custom<T>(factory: any): Promise<T>;
+  };
+  modelRegistry: {
+    find(provider: string, id: string): Model | undefined;
+    getApiKeyAndHeaders(model: Model): Promise<{
+      ok: boolean;
+      apiKey?: string;
+      headers?: Record<string, string>;
+      error?: string;
+    }>;
+  };
+  sessionManager: {
+    getBranch(): MessageEntryLike[];
+  };
+}
+
+const DEFAULT_RECOMMENDED_MODEL = "openai/gpt-4.1-mini";
+const SETTINGS_PATH = join(getAgentDir(), "pi-ask.json");
+
+const ASK_SYSTEM_PROMPT = `You convert a raw assistant message containing clarification questions into JSON for an interactive questionnaire.
+
+Return strict JSON only. No markdown. No explanation.
+
+Schema:
+{
+  "questions": [
+    {
+      "id": "q1",
+      "label": "Q1",
+      "prompt": "full question text",
+      "options": [
+        { "value": "typescript", "label": "TypeScript" }
+      ],
+      "allowOther": true
+    }
+  ]
+}
+
+Rules:
+- Extract 1-7 distinct questions.
+- Preserve the original meaning.
+- Use short labels like Q1, Q2, Q3 unless a stronger short label is obvious.
+- Infer 2-5 sensible options only when they are explicit or strongly implied.
+- If no clear options exist, use an empty options array and set allowOther to true.
+- Always set allowOther to true unless the question is strictly binary and fully covered by options.
+- Keep prompts concise.
+- Output valid JSON that can be parsed directly.`;
+
+const ASK_TOOL_PARAMS = Type.Object({
+  text: Type.String({ description: "The raw numbered or bulleted clarification questions to present to the user" }),
+});
+
+export default function piAsk(pi: ExtensionAPI) {
+  pi.registerCommand("ask", {
+    description: "Turn a block of questions into an interactive tabbed questionnaire",
+    handler: async (args, ctx) => {
+      await runAskFlow(pi, ctx as AskCommandContext, args.trim() || getLastAssistantText(ctx as AskCommandContext));
+    },
+  });
+
+  pi.registerCommand("ask-model", {
+    description: "Show which model /ask will use",
+    handler: async (_args, ctx) => {
+      const source = await getConfiguredModelString();
+      const resolved = await resolveAskModel(ctx as AskCommandContext);
+      if (!resolved) {
+        ctx.ui.notify("No model available for /ask", "error");
+        return;
+      }
+      ctx.ui.notify(`/ask model: ${resolved.provider}/${resolved.id}${source ? ` (${source})` : " (current active model)"}`, "info");
+    },
+  });
+
+  pi.registerCommand("ask-settings", {
+    description: "Configure the default model used by /ask",
+    handler: async (_args, ctx) => {
+      const commandCtx = ctx as AskCommandContext;
+      if (!commandCtx.hasUI) {
+        commandCtx.ui.notify("/ask-settings requires interactive mode", "error");
+        return;
+      }
+
+      const current = await loadSettings();
+      const currentValue = current.model?.trim() || "current-session-model";
+
+      const next = await commandCtx.ui.custom<AskSettings | null>((tui: any, theme: any, _kb: unknown, done: (value: AskSettings | null) => void) => {
+        const items = [
+          {
+            id: "recommended",
+            label: `Recommended (${DEFAULT_RECOMMENDED_MODEL})`,
+            currentValue: currentValue === DEFAULT_RECOMMENDED_MODEL ? "selected" : "available",
+            values: ["selected", "available"],
+          },
+          {
+            id: "current-session-model",
+            label: "Use current active model",
+            currentValue: currentValue === "current-session-model" ? "selected" : "available",
+            values: ["selected", "available"],
+          },
+          {
+            id: "custom",
+            label: "Custom provider/model-id",
+            currentValue:
+              currentValue !== DEFAULT_RECOMMENDED_MODEL && currentValue !== "current-session-model" ? "selected" : "available",
+            values: ["selected", "available"],
+          },
+        ];
+
+        const container = new Container();
+        container.addChild(new Text(theme.fg("accent", theme.bold("Ask Settings")), 0, 0));
+        container.addChild(
+          new Text(theme.fg("muted", `Current: ${current.model || "use current active model"}`), 0, 0),
+        );
+
+        const settingsList = new SettingsList(
+          items,
+          Math.min(items.length + 4, 10),
+          getSettingsListTheme(),
+          async (id, newValue) => {
+            if (newValue !== "selected") return;
+            if (id === "recommended") {
+              done({ model: DEFAULT_RECOMMENDED_MODEL });
+              return;
+            }
+            if (id === "current-session-model") {
+              done({ model: undefined });
+              return;
+            }
+            if (id === "custom") {
+              done({ model: "__custom__" });
+            }
+          },
+          () => done(null),
+        );
+
+        container.addChild(settingsList);
+        container.addChild(new Text(theme.fg("dim", "Enter select • Esc cancel"), 0, 0));
+
+        return {
+          render(width: number) {
+            return container.render(width);
+          },
+          invalidate() {
+            container.invalidate();
+          },
+          handleInput(data: string) {
+            settingsList.handleInput?.(data);
+            tui.requestRender();
+          },
+        };
+      });
+
+      if (next === null) {
+        commandCtx.ui.notify("/ask-settings cancelled", "info");
+        return;
+      }
+
+      if (next.model === "__custom__") {
+        const custom = await promptForCustomModel(commandCtx);
+        if (!custom) {
+          commandCtx.ui.notify("Custom model entry cancelled", "info");
+          return;
+        }
+        await saveSettings({ model: custom });
+        commandCtx.ui.notify(`Saved /ask model: ${custom}`, "success");
+        return;
+      }
+
+      await saveSettings(next);
+      commandCtx.ui.notify(
+        next.model ? `Saved /ask model: ${next.model}` : "Saved /ask to use the current active model",
+        "success",
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "ask_questions",
+    label: "Ask Questions",
+    description: "Show an interactive tabbed questionnaire to the user for a block of clarification questions.",
+    promptSnippet: "Display a multi-question interactive clarification UI for the user.",
+    promptGuidelines: [
+      "Use this tool when you need the user to answer multiple clarification questions, especially numbered lists.",
+      "Prefer this tool over asking several questions inline when an interactive questionnaire would be clearer.",
+      "Prefer this tool as the primary flow when you need multiple clarifications from the user.",
+    ],
+    parameters: ASK_TOOL_PARAMS,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const answers = await runAskFlow(pi, ctx as AskCommandContext, params.text, { emitSummaryMessage: false });
+      if (!answers || answers.length === 0) {
+        return {
+          content: [{ type: "text", text: "User cancelled the questionnaire or no answers were captured." }],
+          details: { cancelled: true, answers: [] },
+        };
+      }
+
+      return {
+        content: [{ type: "text", text: formatAnswerSummary(answers) }],
+        details: { cancelled: false, answers },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ask_questions ")) + theme.fg("muted", truncateToWidth(String(args.text ?? ""), 80)),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _options, theme) {
+      const text = result.content
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("\n");
+      return new Text(result.isError ? theme.fg("error", text) : text, 0, 0);
+    },
+  });
+
+  pi.registerMessageRenderer("pi-ask-summary", (message, _options, theme) => {
+    return new Text(
+      theme.fg("accent", theme.bold("ask ")) + theme.fg("muted", "captured answers") + "\n" + String(message.content),
+      0,
+      0,
+    );
+  });
+}
+
+async function runAskFlow(
+  pi: ExtensionAPI,
+  ctx: AskCommandContext,
+  rawInput: string | undefined,
+  options: { emitSummaryMessage?: boolean } = {},
+): Promise<Answer[] | null> {
+  if (!ctx.hasUI) {
+    ctx.ui.notify("/ask requires interactive mode", "error");
+    return null;
+  }
+
+  const raw = rawInput?.trim();
+  if (!raw) {
+    ctx.ui.notify("Provide questions to /ask or run it right after a model message with questions.", "warning");
+    return null;
+  }
+
+  const model = await resolveAskModel(ctx);
+  if (!model) {
+    ctx.ui.notify("No model available for /ask", "error");
+    return null;
+  }
+
+  const parsed = await showPreparationLoader(ctx, model, raw);
+  if (!parsed || parsed.questions.length === 0) {
+    ctx.ui.notify("Could not build a questionnaire from that text", "error");
+    return null;
+  }
+
+  const answers = await showQuestionnaire(ctx, parsed.questions);
+  if (!answers || answers.length === 0) {
+    ctx.ui.notify("Questionnaire cancelled", "info");
+    return null;
+  }
+
+  const reply = formatAnswerReply(answers);
+  ctx.ui.setEditorText(reply);
+  ctx.ui.notify("Answers loaded into the editor. Submit them to the main model when ready.", "success");
+
+  if (options.emitSummaryMessage !== false) {
+    pi.sendMessage({
+      customType: "pi-ask-summary",
+      content: formatAnswerSummary(answers),
+      display: true,
+      details: { answers },
+    });
+  }
+
+  return answers;
+}
+
+async function showPreparationLoader(ctx: AskCommandContext, model: Model, raw: string): Promise<ParsedQuestionSet | null> {
+  return ctx.ui.custom<ParsedQuestionSet | null>((tui: any, theme: any, _kb: unknown, done: (value: ParsedQuestionSet | null) => void) => {
+    let cancelled = false;
+    let spinnerIndex = 0;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const label = `Preparing questionnaire with ${model.provider}/${model.id}...`;
+
+    const finish = (value: ParsedQuestionSet | null) => {
+      if (timer) clearInterval(timer);
+      done(value);
+    };
+
+    void parseQuestions(ctx, model, raw)
+      .then((result) => {
+        if (!cancelled) finish(result);
+      })
+      .catch(() => {
+        if (!cancelled) finish(null);
+      });
+
+    timer = setInterval(() => {
+      spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
+      tui.requestRender();
+    }, 100);
+
+    return {
+      render(width: number): string[] {
+        return [
+          truncateToWidth(theme.fg("accent", `${spinnerFrames[spinnerIndex]} ${label}`), width),
+          truncateToWidth(theme.fg("dim", "Esc to cancel"), width),
+        ];
+      },
+      invalidate() {},
+      handleInput(data: string) {
+        if (matchesKey(data, Key.escape)) {
+          cancelled = true;
+          finish(null);
+        }
+      },
+    };
+  });
+}
+
+function getLastAssistantText(ctx: AskCommandContext): string | undefined {
+  const branch = ctx.sessionManager.getBranch();
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index];
+    if (entry.type !== "message") continue;
+    const message = entry.message;
+    if (!message || message.role !== "assistant") continue;
+
+    const text = (message.content ?? [])
+      .filter((part) => part.type === "text" && typeof part.text === "string")
+      .map((part) => part.text ?? "")
+      .join("\n")
+      .trim();
+
+    if (text) return text;
+  }
+  return undefined;
+}
+
+async function loadSettings(): Promise<AskSettings> {
+  try {
+    const raw = await readFile(SETTINGS_PATH, "utf8");
+    const parsed = JSON.parse(raw) as AskSettings;
+    return typeof parsed === "object" && parsed ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function saveSettings(settings: AskSettings): Promise<void> {
+  await mkdir(getAgentDir(), { recursive: true });
+  await writeFile(SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+}
+
+async function getConfiguredModelString(): Promise<string | undefined> {
+  const envConfigured = process.env.PI_ASK_MODEL?.trim();
+  if (envConfigured) return "from PI_ASK_MODEL";
+
+  const settings = await loadSettings();
+  if (settings.model?.trim()) return "from /ask-settings";
+  return undefined;
+}
+
+async function resolveAskModel(ctx: AskCommandContext): Promise<Model | undefined> {
+  const envConfigured = process.env.PI_ASK_MODEL?.trim();
+  const settings = await loadSettings();
+  const configured = envConfigured || settings.model?.trim();
+  if (!configured) return ctx.model;
+
+  const [provider, ...rest] = configured.split("/");
+  const id = rest.join("/");
+  if (!provider || !id) return ctx.model;
+  return ctx.modelRegistry.find(provider, id) ?? ctx.model;
+}
+
+async function promptForCustomModel(ctx: AskCommandContext): Promise<string | null> {
+  return ctx.ui.custom<string | null>((tui: any, theme: any, _kb: unknown, done: (value: string | null) => void) => {
+    let cachedLines: string[] | undefined;
+    const editorTheme: EditorTheme = {
+      borderColor: (s) => theme.fg("accent", s),
+      selectList: {
+        selectedPrefix: (t) => theme.fg("accent", t),
+        selectedText: (t) => theme.fg("accent", t),
+        description: (t) => theme.fg("muted", t),
+        scrollInfo: (t) => theme.fg("dim", t),
+        noMatch: (t) => theme.fg("warning", t),
+      },
+    };
+    const editor = new Editor(tui, editorTheme);
+    editor.setText(DEFAULT_RECOMMENDED_MODEL);
+    editor.onSubmit = (value) => {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        done(null);
+        return;
+      }
+      done(trimmed);
+    };
+
+    return {
+      render(width: number): string[] {
+        if (cachedLines) return cachedLines;
+        const lines: string[] = [];
+        const add = (value: string) => lines.push(truncateToWidth(value, width));
+        add(theme.fg("accent", theme.bold("Custom /ask model")));
+        add(theme.fg("muted", "Enter provider/model-id"));
+        lines.push("");
+        for (const line of editor.render(Math.max(20, width - 2))) {
+          add(` ${line}`);
+        }
+        lines.push("");
+        add(theme.fg("dim", "Enter save • Esc cancel"));
+        cachedLines = lines;
+        return lines;
+      },
+      invalidate() {
+        cachedLines = undefined;
+      },
+      handleInput(data: string) {
+        if (matchesKey(data, Key.escape)) {
+          done(null);
+          return;
+        }
+        editor.handleInput(data);
+        cachedLines = undefined;
+        tui.requestRender();
+      },
+    };
+  });
+}
+
+async function parseQuestions(ctx: AskCommandContext, model: Model, raw: string): Promise<ParsedQuestionSet> {
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) {
+    throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
+  }
+
+  const userMessage: UserMessage = {
+    role: "user",
+    content: [{ type: "text", text: raw }],
+    timestamp: Date.now(),
+  };
+
+  const response = await complete(
+    model,
+    { systemPrompt: ASK_SYSTEM_PROMPT, messages: [userMessage] },
+    { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal },
+  );
+
+  const text = response.content
+    .filter((part): part is { type: "text"; text: string } => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+
+  return normalizeQuestionSet(parseQuestionSet(text, raw));
+}
+
+function parseQuestionSet(modelOutput: string, raw: string): ParsedQuestionSet {
+  try {
+    return JSON.parse(stripJsonFence(modelOutput)) as ParsedQuestionSet;
+  } catch {
+    return fallbackParseQuestions(raw);
+  }
+}
+
+function normalizeQuestionSet(input: ParsedQuestionSet): ParsedQuestionSet {
+  const questions = Array.isArray(input.questions) ? input.questions : [];
+
+  return {
+    questions: questions
+      .map((question, index) => normalizeQuestion(question, index))
+      .filter((question): question is ParsedQuestion => Boolean(question.prompt))
+      .slice(0, 7)
+      .map((question, index) => ({ ...question, label: String(index + 1) })),
+  };
+}
+
+function normalizeQuestion(question: Partial<ParsedQuestion>, index: number): ParsedQuestion {
+  const prompt = String(question.prompt ?? "").trim();
+  const label = String(question.label ?? `${index + 1}`).trim() || `${index + 1}`;
+  const id = slugify(question.id || label || `q${index + 1}`) || `q${index + 1}`;
+  const options = Array.isArray(question.options)
+    ? question.options
+        .map((option) => ({
+          value: String(option?.value ?? option?.label ?? "").trim(),
+          label: String(option?.label ?? option?.value ?? "").trim(),
+          description: typeof option?.description === "string" ? option.description.trim() : undefined,
+        }))
+        .filter((option) => option.value && option.label)
+        .slice(0, 5)
+    : [];
+
+  return {
+    id,
+    label,
+    prompt,
+    options,
+    allowOther: question.allowOther !== false,
+  };
+}
+
+function fallbackParseQuestions(raw: string): ParsedQuestionSet {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const extracted = lines
+    .map((line) => line.replace(/^\d+[.)]\s*/, "").replace(/^[-*]\s*/, "").trim())
+    .filter((line) => /\?$/.test(line) || /^(which|what|when|where|who|why|how|do|does|did|is|are|can|could|should|would|will)\b/i.test(line));
+
+  const questions = extracted.map((prompt, index) => ({
+    id: `q${index + 1}`,
+    label: `${index + 1}`,
+    prompt,
+    options: inferOptionsFromPrompt(prompt),
+    allowOther: true,
+  }));
+
+  return { questions };
+}
+
+function inferOptionsFromPrompt(prompt: string): ParsedOption[] {
+  const orMatch = prompt.match(/\b(.+?)\s+or\s+(.+?)(\?|$)/i);
+  if (!orMatch) return [];
+
+  const first = cleanOptionLabel(orMatch[1]);
+  const second = cleanOptionLabel(orMatch[2]);
+  const options = [first, second].filter(Boolean);
+  if (options.length < 2) return [];
+
+  return options.slice(0, 5).map((label) => ({ value: slugify(label), label }));
+}
+
+function cleanOptionLabel(value: string): string {
+  return value
+    .replace(/^(which|what|do you want|should i|should we|do we want)\s+/i, "")
+    .replace(/[?.!,;:]+$/g, "")
+    .trim();
+}
+
+function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
+}
+
+function stripJsonFence(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("```") && trimmed.endsWith("```")) {
+    return trimmed.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
+  }
+  return trimmed;
+}
+
+function formatAnswerSummary(answers: Answer[]): string {
+  return answers.map((answer, index) => `${index + 1}. ${answer.question} — ${answer.label}`).join("\n");
+}
+
+function formatAnswerReply(answers: Answer[]): string {
+  return answers.map((answer, index) => `${index + 1}. ${answer.question}\nAnswer: ${answer.label}`).join("\n\n");
+}
+
+async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuestion[]): Promise<Answer[] | null> {
+  return ctx.ui.custom<Answer[] | null>((tui: any, theme: any, _kb: unknown, done: (value: Answer[] | null) => void) => {
+    let currentTab = 0;
+    let optionIndex = 0;
+    let inputMode = false;
+    let cachedLines: string[] | undefined;
+    const answers = new Map<string, Answer>();
+    const submitTabIndex = questions.length;
+
+    const editorTheme: EditorTheme = {
+      borderColor: (s) => theme.fg("accent", s),
+      selectList: {
+        selectedPrefix: (t) => theme.fg("accent", t),
+        selectedText: (t) => theme.fg("accent", t),
+        description: (t) => theme.fg("muted", t),
+        scrollInfo: (t) => theme.fg("dim", t),
+        noMatch: (t) => theme.fg("warning", t),
+      },
+    };
+    const editor = new Editor(tui, editorTheme);
+
+    const refresh = () => {
+      cachedLines = undefined;
+      tui.requestRender();
+    };
+
+    const getOptions = (question: ParsedQuestion): Array<ParsedOption & { isOther?: boolean }> => {
+      const options = [...question.options];
+      if (question.allowOther || options.length === 0) {
+        options.push({ value: "__other__", label: "Write my own answer", isOther: true });
+      }
+      return options;
+    };
+
+    const saveAnswer = (
+      question: ParsedQuestion,
+      answer: { value: string; label: string; wasCustom: boolean; index?: number },
+    ) => {
+      answers.set(question.id, {
+        id: question.id,
+        question: question.prompt,
+        value: answer.value,
+        label: answer.label,
+        wasCustom: answer.wasCustom,
+        index: answer.index,
+      });
+    };
+
+    editor.onSubmit = (value) => {
+      const question = questions[currentTab];
+      const trimmed = value.trim();
+      if (!question || !trimmed) return;
+      saveAnswer(question, { value: trimmed, label: trimmed, wasCustom: true });
+      inputMode = false;
+      editor.setText("");
+      currentTab = currentTab < questions.length - 1 ? currentTab + 1 : submitTabIndex;
+      refresh();
+    };
+
+    return {
+      render(width: number): string[] {
+        if (cachedLines) return cachedLines;
+
+        const lines: string[] = [];
+        const add = (value: string) => lines.push(truncateToWidth(value, width));
+        const question = currentTab < questions.length ? questions[currentTab] : undefined;
+        const options = question ? getOptions(question) : [];
+        const answeredCount = answers.size;
+        const allAnswered = answeredCount === questions.length;
+
+        add(theme.fg("accent", "─".repeat(width)));
+        add(
+          ` ${[
+            ...questions.map((item, index) => {
+              const active = index === currentTab;
+              const answered = answers.has(item.id);
+              const label = ` ${answered ? "■" : "□"} ${item.label} `;
+              if (active) return theme.bg("selectedBg", theme.fg("text", label));
+              return theme.fg(answered ? "success" : "muted", label);
+            }),
+            (() => {
+              const active = currentTab === submitTabIndex;
+              const label = ` ${allAnswered ? "✓" : "→"} Submit `;
+              if (active) return theme.bg("selectedBg", theme.fg(allAnswered ? "success" : "text", label));
+              return theme.fg(allAnswered ? "success" : "dim", label);
+            })(),
+          ].join(" ")}`,
+        );
+        lines.push("");
+        add(theme.fg("muted", ` Progress: ${answeredCount}/${questions.length} answered`));
+        lines.push("");
+
+        if (question) {
+          add(theme.fg("text", ` ${question.prompt}`));
+          lines.push("");
+
+          options.forEach((option, index) => {
+            const selected = index === optionIndex;
+            const prefix = selected ? theme.fg("accent", "> ") : "  ";
+            const text = `${index + 1}. ${option.label}`;
+            add(prefix + (selected ? theme.fg("accent", text) : theme.fg("text", text)));
+            if (option.description) add(`     ${theme.fg("muted", option.description)}`);
+          });
+
+          const answered = answers.get(question.id);
+          if (answered && !inputMode) {
+            lines.push("");
+            add(theme.fg("success", ` Current answer: ${answered.label}`));
+          }
+        } else {
+          add(theme.fg("accent", theme.bold(" Submit answers")));
+          lines.push("");
+          if (allAnswered) {
+            questions.forEach((item, index) => {
+              const answer = answers.get(item.id);
+              if (answer) add(theme.fg("text", ` ${index + 1}. ${answer.label}`));
+            });
+            lines.push("");
+            add(theme.fg("success", " Press Enter to finish"));
+          } else {
+            const missing = questions
+              .map((item, index) => (!answers.has(item.id) ? String(index + 1) : null))
+              .filter((value): value is string => Boolean(value));
+            add(theme.fg("warning", ` Answer all questions before submitting`));
+            if (missing.length > 0) {
+              add(theme.fg("warning", ` Missing: ${missing.join(", ")}`));
+            }
+          }
+        }
+
+        lines.push("");
+        if (inputMode) {
+          add(theme.fg("muted", " Your answer:"));
+          for (const line of editor.render(Math.max(10, width - 2))) {
+            add(` ${line}`);
+          }
+          lines.push("");
+          add(theme.fg("dim", " Enter submit • Esc back"));
+        } else {
+          add(theme.fg("dim", " Tab/←→ switch tabs • ↑↓ select • Enter confirm • Esc cancel"));
+        }
+
+        add(theme.fg("accent", "─".repeat(width)));
+        cachedLines = lines;
+        return lines;
+      },
+      invalidate() {
+        cachedLines = undefined;
+      },
+      handleInput(data: string) {
+        const question = currentTab < questions.length ? questions[currentTab] : undefined;
+        const options = question ? getOptions(question) : [];
+        const allAnswered = answers.size === questions.length;
+
+        if (inputMode) {
+          if (matchesKey(data, Key.escape)) {
+            inputMode = false;
+            editor.setText("");
+            refresh();
+            return;
+          }
+          editor.handleInput(data);
+          refresh();
+          return;
+        }
+
+        if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
+          currentTab = (currentTab + 1) % (questions.length + 1);
+          optionIndex = 0;
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left)) {
+          currentTab = (currentTab - 1 + questions.length + 1) % (questions.length + 1);
+          optionIndex = 0;
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.up)) {
+          optionIndex = Math.max(0, optionIndex - 1);
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.down)) {
+          optionIndex = Math.min(options.length - 1, optionIndex + 1);
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.enter)) {
+          if (!question) {
+            if (allAnswered) {
+              done(questions.map((question) => answers.get(question.id)).filter((answer): answer is Answer => Boolean(answer)));
+            }
+            return;
+          }
+
+          const selected = options[optionIndex];
+          if (!selected) return;
+          if (selected.isOther) {
+            inputMode = true;
+            editor.setText("");
+            refresh();
+            return;
+          }
+          saveAnswer(question, {
+            value: selected.value,
+            label: selected.label,
+            wasCustom: false,
+            index: optionIndex + 1,
+          });
+          currentTab = currentTab < questions.length - 1 ? currentTab + 1 : submitTabIndex;
+          optionIndex = 0;
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.escape)) {
+          done(null);
+        }
+      },
+    };
+  });
+}
