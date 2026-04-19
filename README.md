@@ -11,11 +11,27 @@ It adds:
 
 ## Install
 
+From npm (recommended):
+
 ```bash
-pi install /path/to/pi-ask
-# or, once published
 pi install npm:pi-ask
 ```
+
+From the GitHub repo:
+
+```bash
+pi install git:github.com/AlvaroRausell/pi-ask
+```
+
+From a local clone:
+
+```bash
+git clone https://github.com/AlvaroRausell/pi-ask.git
+cd pi-ask
+pi install .
+```
+
+After installing, the `ask` skill, `ask_questions` tool, and `/ask` command will be available in your next Pi session.
 
 ## Recommended flow
 
