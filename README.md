@@ -14,7 +14,7 @@ It adds:
 From npm (recommended):
 
 ```bash
-pi install npm:pi-ask
+pi install npm:@alpino13/pi-ask
 ```
 
 From the GitHub repo:
@@ -137,8 +137,6 @@ export PI_ASK_MODEL="openai/gpt-4.1-mini"
 
 ## Publishing
 
-This repo already uses the Pi package manifest in `package.json`, so once published to npm it should be installable with:
-
 ```bash
-pi install npm:pi-ask
+pi install npm:@alpino13/pi-ask
 ```

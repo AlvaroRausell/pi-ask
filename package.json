@@ -1,5 +1,5 @@
 {
-  "name": "pi-ask",
+  "name": "@alpino13/pi-ask",
   "version": "0.1.0",
   "description": "Pi package for interactive multi-question clarification flows, with a model-callable ask_questions tool and tabbed questionnaire UI.",
   "keywords": ["pi-package", "pi", "skill", "extension", "questionnaire", "clarification"],
