@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { complete, type Model, type UserMessage } from "@mariozechner/pi-ai";
+import { completeSimple, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import { getAgentDir, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Container, Editor, type EditorTheme, Key, matchesKey, SettingsList, Text, truncateToWidth } from "@mariozechner/pi-tui";
@@ -98,7 +98,8 @@ Rules:
 - If no clear options exist, use an empty options array and set allowOther to true.
 - Always set allowOther to true unless the question is strictly binary and fully covered by options.
 - Keep prompts concise.
-- Output valid JSON that can be parsed directly.`;
+- Output valid JSON that can be parsed directly.
+- Do NOT think or reason. Just output the JSON immediately.`;
 
 const ASK_TOOL_PARAMS = Type.Object({
   text: Type.String({ description: "The raw numbered or bulleted clarification questions to present to the user" }),
@@ -498,10 +499,10 @@ async function parseQuestions(ctx: AskCommandContext, model: Model, raw: string)
     timestamp: Date.now(),
   };
 
-  const response = await complete(
+  const response = await completeSimple(
     model,
     { systemPrompt: ASK_SYSTEM_PROMPT, messages: [userMessage] },
-    { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal },
+    { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal, reasoning: "minimal" },
   );
 
   const text = response.content
