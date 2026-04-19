@@ -786,7 +786,7 @@ async function showQuestionnaire(ctx: AskCommandContext, questions: ParsedQuesti
             ...questions.map((item, index) => {
               const active = index === currentTab;
               const answered = answers.has(item.id);
-              const typeIcon = item.type !== "single" ? " ⏳" : "";
+              const typeIcon = item.type === "multi" ? " ≡" : item.type === "checkbox" ? " ☑" : "";
               const label = ` ${answered ? "■" : "□"} ${item.label}${typeIcon} `;
               if (active) return theme.bg("selectedBg", theme.fg("text", label));
               return theme.fg(answered ? "success" : "muted", label);
