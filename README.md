@@ -117,29 +117,3 @@ This repo already uses the Pi package manifest in `package.json`, so once publis
 ```bash
 pi install npm:pi-ask
 ```
-
-## npm publish checklist
-
-1. Log in to npm:
-
-```bash
-npm login
-```
-
-3. Preview the published tarball:
-
-```bash
-npm pack --dry-run
-```
-
-4. Publish the package:
-
-```bash
-npm publish --access public
-```
-
-5. Verify installation in Pi:
-
-```bash
-pi install npm:pi-ask
-```
