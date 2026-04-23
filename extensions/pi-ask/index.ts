@@ -255,7 +255,10 @@ export default function piAsk(pi: ExtensionAPI) {
     ],
     parameters: ASK_TOOL_PARAMS,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const answers = await runAskFlow(pi, ctx as AskCommandContext, params.text, { emitSummaryMessage: false });
+      const answers = await runAskFlow(pi, ctx as AskCommandContext, params.text, {
+        emitSummaryMessage: false,
+        loadAnswersIntoEditor: false,
+      });
       if (!answers || answers.length === 0) {
         return {
           content: [{ type: "text", text: "User cancelled the questionnaire or no answers were captured." }],
@@ -295,11 +298,16 @@ export default function piAsk(pi: ExtensionAPI) {
   });
 }
 
+interface RunAskFlowOptions {
+  emitSummaryMessage?: boolean;
+  loadAnswersIntoEditor?: boolean;
+}
+
 async function runAskFlow(
   pi: ExtensionAPI,
   ctx: AskCommandContext,
   rawInput: string | undefined,
-  options: { emitSummaryMessage?: boolean } = {},
+  options: RunAskFlowOptions = {},
 ): Promise<Answer[] | null> {
   if (!ctx.hasUI) {
     ctx.ui.notify("/ask requires interactive mode", "error");
@@ -330,9 +338,11 @@ async function runAskFlow(
     return null;
   }
 
-  const reply = formatAnswerReply(answers);
-  ctx.ui.setEditorText(reply);
-  ctx.ui.notify("Answers loaded into the editor. Submit them to the main model when ready.", "success");
+  if (options.loadAnswersIntoEditor !== false) {
+    const reply = formatAnswerReply(answers);
+    ctx.ui.setEditorText(reply);
+    ctx.ui.notify("Answers loaded into the editor. Submit them to the main model when ready.", "success");
+  }
 
   if (options.emitSummaryMessage !== false) {
     pi.sendMessage({

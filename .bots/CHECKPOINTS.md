@@ -8,8 +8,8 @@
 
 - **Project**: pi-ask
 - **Started**: 2026-04-19
-- **Last session log**: `.bots/logs/2026-04-19-release-cleanup.md`
-- **Status**: Release-polished pi package with direct tool flow, settings command, submit-tab UX, and publish scaffolding
+- **Last session log**: `.bots/logs/2026-04-23-ask-questions-submit-behavior.md`
+- **Status**: Release-polished pi package with direct tool flow, settings command, submit-tab UX, publish scaffolding, and corrected ask_questions submit behavior
 
 ---
 
@@ -32,6 +32,7 @@
 - `/ask` uses the current model by default, with `PI_ASK_MODEL=provider/model-id` override and `/ask-settings` for saved configuration of a cheaper/smaller LLM.
 - `/ask` parses question blocks into structured JSON and presents them as a tabbed questionnaire UI.
 - The extension also exposes an `ask_questions` custom tool so models can launch the questionnaire directly, and that is now the preferred flow.
+- `ask_questions` now returns captured answers directly to the calling model without also preloading the main editor; editor prefill remains manual `/ask` behavior only.
 - Invalid JSON from the smaller model falls back to local numbered-list parsing with simple `or` option inference.
 
 ---

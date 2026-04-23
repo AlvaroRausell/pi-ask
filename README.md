@@ -69,7 +69,9 @@ The ask flow will:
 4. show progress like `2/3 answered`
 5. load a natural-language answer bundle into the editor
 
-The package currently keeps answers in the editor only. It does not auto-send them back to the main model.
+Manual `/ask` keeps answers in the editor only and does not auto-send them back to the main model.
+
+The `ask_questions` tool behaves differently: it returns the captured answers directly to the calling model and does not also preload the editor.
 
 ## Configuring the smaller LLM
 
